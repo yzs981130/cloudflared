@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/proxy"
 )
 
 // DialEdge makes a TLS connection to a Cloudflare edge node
@@ -17,17 +18,41 @@ func DialEdge(
 	edgeTCPAddr *net.TCPAddr,
 	localIP net.IP,
 ) (net.Conn, error) {
-	// Inherit from parent context so we can cancel (Ctrl-C) while dialing
-	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
-	defer dialCancel()
-
 	dialer := net.Dialer{}
 	if localIP != nil {
 		dialer.LocalAddr = &net.TCPAddr{IP: localIP, Port: 0}
 	}
-	edgeConn, err := dialer.DialContext(dialCtx, "tcp", edgeTCPAddr.String())
+
+	proxyDialer := proxy.FromEnvironmentUsing(&dialer)
+
+	var edgeConn net.Conn
+	var err error
+
+	// Inherit from parent context so we can cancel (Ctrl-C) while dialing
+	dialCtx, dialCancel := context.WithTimeout(ctx, timeout)
+	defer dialCancel()
+
+	if ctxDialer, ok := proxyDialer.(proxy.ContextDialer); ok {
+		edgeConn, err = ctxDialer.DialContext(dialCtx, "tcp", edgeTCPAddr.String())
+	} else {
+		// Fallback for proxy dialers that don't implement ContextDialer.
+		// Run in a goroutine so the context timeout is still respected.
+		done := make(chan struct{})
+		go func() {
+			edgeConn, err = proxyDialer.Dial("tcp", edgeTCPAddr.String())
+			close(done)
+			if edgeConn != nil && dialCtx.Err() != nil {
+				edgeConn.Close()
+			}
+		}()
+		select {
+		case <-dialCtx.Done():
+			err = dialCtx.Err()
+		case <-done:
+		}
+	}
 	if err != nil {
-		return nil, newDialError(err, "DialContext error")
+		return nil, newDialError(err, "dial edge error")
 	}
 
 	tlsEdgeConn := tls.Client(edgeConn, tlsConfig)
